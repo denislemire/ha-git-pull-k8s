@@ -1,0 +1,134 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app: homeassistant
+  name: homeassistant
+  namespace: homeassistant
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: homeassistant
+  template:
+    metadata:
+      labels:
+        app: homeassistant
+    spec:
+      containers:
+      - image: ghcr.io/home-assistant/home-assistant:stable
+        imagePullPolicy: Always
+        name: homeassistant
+        resources:
+          limits:
+            cpu: "1"
+            memory: 2Gi
+          requests:
+            cpu: 200m
+            memory: 512Mi
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - mountPath: /config
+          name: config
+        - mountPath: /dev/ttyUSB0
+          name: usb
+          readOnly: false
+      - name: git-pull-sidecar
+        image: alpine/git:latest
+        command:
+        - /bin/sh
+        - -c
+        - |
+          # Set up SSH if secret is mounted
+          if [ -d /root/.ssh-secret ]; then
+            mkdir -p /root/.ssh
+            for key in id_rsa id_ed25519 id_ecdsa; do
+              if [ -f /root/.ssh-secret/$key ]; then
+                cp /root/.ssh-secret/$key /root/.ssh/$key
+                chmod 600 /root/.ssh/$key
+              fi
+            done
+            if [ -f /root/.ssh-secret/known_hosts ]; then
+              cp /root/.ssh-secret/known_hosts /root/.ssh/known_hosts
+              chmod 644 /root/.ssh/known_hosts
+            fi
+            echo "StrictHostKeyChecking accept-new" >> /root/.ssh/config
+            chmod 600 /root/.ssh/config
+          fi
+          
+          # Install kubectl (detect architecture)
+          apk add --no-cache curl bash
+          ARCH=$(uname -m)
+          case "$ARCH" in
+            x86_64) KUBECTL_ARCH="amd64" ;;
+            aarch64|arm64) KUBECTL_ARCH="arm64" ;;
+            armv7l|armv6l) KUBECTL_ARCH="arm" ;;
+            *) KUBECTL_ARCH="amd64" ;;
+          esac
+          
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/${KUBECTL_ARCH}/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          
+          # Copy script and make executable
+          cp /scripts/git-pull.sh /tmp/git-pull.sh
+          chmod +x /tmp/git-pull.sh
+          
+          # Run in loop (every 5 minutes)
+          while true; do
+            /tmp/git-pull.sh
+            sleep 300
+          done
+        env:
+        - name: REPOSITORY
+          value: "https://github.com/denislemire/ha-git-pull-k8s.git"
+        - name: GIT_BRANCH
+          value: "master"
+        - name: GIT_COMMAND
+          value: "pull"
+        - name: GIT_REMOTE
+          value: "origin"
+        - name: GIT_PRUNE
+          value: "false"
+        - name: CONFIG_DIR
+          value: "/config"
+        - name: AUTO_RESTART
+          value: "false"
+        - name: RESTART_IGNORE
+          value: "ui-lovelace.yaml,.gitignore"
+        - name: REPEAT_ACTIVE
+          value: "true"
+        - name: REPEAT_INTERVAL
+          value: "300"
+        volumeMounts:
+        - name: config
+          mountPath: /config
+        - name: scripts
+          mountPath: /scripts
+        - name: ssh-key
+          mountPath: /root/.ssh-secret
+          readOnly: true
+      dnsPolicy: ClusterFirst
+      hostNetwork: true
+      nodeSelector:
+        homeassistant: "true"
+      restartPolicy: Always
+      volumes:
+      - name: config
+        persistentVolumeClaim:
+          claimName: homeassistant-config
+      - hostPath:
+          path: /dev/ttyUSB0
+          type: ""
+        name: usb
+      - name: scripts
+        configMap:
+          name: git-pull-script
+          defaultMode: 0755
+      - name: ssh-key
+        secret:
+          secretName: git-pull-ssh-key
+          defaultMode: 0400
+          optional: true
+
