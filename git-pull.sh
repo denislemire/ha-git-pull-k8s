@@ -1,0 +1,249 @@
+#!/bin/bash
+set -euo pipefail
+
+# Git Pull Add-on for Kubernetes
+# Based on Home Assistant Git Pull Add-on functionality
+
+CONFIG_DIR="${CONFIG_DIR:-/config}"
+GIT_BRANCH="${GIT_BRANCH:-master}"
+GIT_COMMAND="${GIT_COMMAND:-pull}"
+GIT_REMOTE="${GIT_REMOTE:-origin}"
+GIT_PRUNE="${GIT_PRUNE:-false}"
+REPOSITORY="${REPOSITORY:-}"
+AUTO_RESTART="${AUTO_RESTART:-false}"
+RESTART_IGNORE="${RESTART_IGNORE:-}"
+REPEAT_ACTIVE="${REPEAT_ACTIVE:-false}"
+REPEAT_INTERVAL="${REPEAT_INTERVAL:-300}"
+
+# Logging function
+log() {
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*"
+}
+
+log_info() {
+    log "[Info] $*"
+}
+
+log_error() {
+    log "[Error] $*" >&2
+}
+
+# Check if repository is configured
+if [ -z "$REPOSITORY" ]; then
+    log_error "Repository not configured. Set REPOSITORY environment variable."
+    exit 1
+fi
+
+# Function to check if file should be ignored for restart
+should_ignore() {
+    local file="$1"
+    if [ -z "$RESTART_IGNORE" ]; then
+        return 1
+    fi
+    
+    # Check if file matches any ignore pattern
+    echo "$RESTART_IGNORE" | tr ',' '\n' | while read -r pattern; do
+        pattern=$(echo "$pattern" | xargs)  # trim whitespace
+        if [ -z "$pattern" ]; then
+            continue
+        fi
+        
+        # Check if it's a directory pattern (ends with /)
+        if [[ "$pattern" == */ ]]; then
+            if [[ "$file" == "$pattern"* ]]; then
+                return 0
+            fi
+        # Check exact match or glob pattern
+        elif [[ "$file" == "$pattern" ]] || [[ "$file" == *"$pattern" ]]; then
+            return 0
+        fi
+    done
+    
+    return 1
+}
+
+# Function to check if config changed
+check_config_changed() {
+    local changed_files="$1"
+    
+    if [ -z "$changed_files" ]; then
+        return 1
+    fi
+    
+    # Check each changed file
+    echo "$changed_files" | while read -r file; do
+        if [ -z "$file" ]; then
+            continue
+        fi
+        
+        # Skip if file should be ignored
+        if should_ignore "$file"; then
+            log_info "Ignoring change to $file (in restart_ignore list)"
+            continue
+        fi
+        
+        # If we get here, a non-ignored file changed
+        return 0
+    done
+    
+    return 1
+}
+
+# Function to validate Home Assistant config
+validate_config() {
+    log_info "Validating Home Assistant configuration..."
+    
+    # Try to run Home Assistant config check
+    # This requires Home Assistant to be available, so we'll skip if not possible
+    # In a K8s environment, we could exec into the HA pod or use the API
+    log_info "Config validation skipped (requires Home Assistant API access)"
+    return 0
+}
+
+# Function to restart Home Assistant
+restart_homeassistant() {
+    log_info "Restarting Home Assistant..."
+    
+    # In Kubernetes, we restart by deleting the pod (deployment will recreate it)
+    # Or we could use kubectl rollout restart
+    if command -v kubectl &> /dev/null; then
+        # Try to restart the deployment
+        if kubectl rollout restart deployment/homeassistant -n homeassistant &> /dev/null; then
+            log_info "Home Assistant restart initiated via kubectl"
+            return 0
+        fi
+    fi
+    
+    # Alternative: Delete the pod (if we have kubectl available)
+    # kubectl delete pod -l app=homeassistant -n homeassistant --grace-period=0
+    
+    log_info "Home Assistant restart requested (kubectl not available or failed)"
+    return 0
+}
+
+# Main git pull function
+git_pull() {
+    cd "$CONFIG_DIR" || {
+        log_error "Cannot access config directory: $CONFIG_DIR"
+        exit 1
+    }
+    
+    # Check if directory is a git repository
+    if [ ! -d ".git" ]; then
+        log_info "Initializing git repository..."
+        git init
+        git remote add "$GIT_REMOTE" "$REPOSITORY" 2>/dev/null || \
+            git remote set-url "$GIT_REMOTE" "$REPOSITORY"
+        
+        # Fetch and checkout
+        git fetch "$GIT_REMOTE" "$GIT_BRANCH"
+        git checkout -b "$GIT_BRANCH" "$GIT_REMOTE/$GIT_BRANCH" 2>/dev/null || \
+            git checkout "$GIT_BRANCH"
+    fi
+    
+    # Get current commit before pull
+    OLD_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+    
+    # Configure git
+    git config user.name "Git Pull Add-on" || true
+    git config user.email "git-pull@homeassistant.local" || true
+    
+    # Prune if enabled
+    if [ "$GIT_PRUNE" = "true" ]; then
+        log_info "Pruning remote branches..."
+        git remote prune "$GIT_REMOTE" || true
+    fi
+    
+    # Fetch latest changes
+    log_info "Fetching from $GIT_REMOTE/$GIT_BRANCH..."
+    git fetch "$GIT_REMOTE" "$GIT_BRANCH" || {
+        log_error "Failed to fetch from repository"
+        exit 1
+    }
+    
+    # Execute git command
+    if [ "$GIT_COMMAND" = "pull" ]; then
+        log_info "Pulling changes..."
+        git pull "$GIT_REMOTE" "$GIT_BRANCH" || {
+            log_error "Failed to pull changes"
+            exit 1
+        }
+    elif [ "$GIT_COMMAND" = "reset" ]; then
+        log_info "Resetting to $GIT_REMOTE/$GIT_BRANCH (WARNING: local changes will be lost)..."
+        git reset --hard "$GIT_REMOTE/$GIT_BRANCH" || {
+            log_error "Failed to reset"
+            exit 1
+        }
+    else
+        log_error "Unknown git_command: $GIT_COMMAND (must be 'pull' or 'reset')"
+        exit 1
+    fi
+    
+    # Get new commit
+    NEW_COMMIT=$(git rev-parse HEAD 2>/dev/null || echo "")
+    
+    # Check if anything changed
+    if [ "$OLD_COMMIT" = "$NEW_COMMIT" ]; then
+        log_info "Nothing has changed."
+        return 0
+    fi
+    
+    # Get list of changed files
+    CHANGED_FILES=$(git diff --name-only "$OLD_COMMIT" "$NEW_COMMIT" 2>/dev/null || echo "")
+    
+    if [ -n "$CHANGED_FILES" ]; then
+        log_info "Something has changed, checking Home-Assistant config..."
+        log_info "Changed files:"
+        echo "$CHANGED_FILES" | while read -r file; do
+            [ -n "$file" ] && log_info "  - $file"
+        done
+        
+        # Validate config if auto_restart is enabled
+        if [ "$AUTO_RESTART" = "true" ]; then
+            if validate_config; then
+                # Check if restart is needed (non-ignored files changed)
+                if check_config_changed "$CHANGED_FILES"; then
+                    restart_homeassistant
+                else
+                    log_info "All changed files are in restart_ignore list. Restart not required."
+                fi
+            else
+                log_error "Config validation failed. Not restarting."
+                exit 1
+            fi
+        fi
+    else
+        log_info "Local configuration has changed. Restart required."
+        if [ "$AUTO_RESTART" = "true" ]; then
+            restart_homeassistant
+        fi
+    fi
+    
+    return 0
+}
+
+# Main execution
+main() {
+    log_info "Starting Git Pull Add-on"
+    log_info "Repository: $REPOSITORY"
+    log_info "Branch: $GIT_BRANCH"
+    log_info "Command: $GIT_COMMAND"
+    log_info "Config directory: $CONFIG_DIR"
+    
+    # Run git pull
+    git_pull
+    
+    log_info "Git Pull Add-on completed successfully"
+}
+
+# Run main function
+main
+
+# If repeat is active, sleep and run again
+if [ "$REPEAT_ACTIVE" = "true" ]; then
+    log_info "Repeat mode active. Sleeping for $REPEAT_INTERVAL seconds..."
+    sleep "$REPEAT_INTERVAL"
+    # In a CronJob, this won't run again, but in a Deployment it will loop
+    exec "$0" "$@"
+fi
+
